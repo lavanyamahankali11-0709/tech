@@ -2,6 +2,10 @@
 import React, { useState } from "react";
 import "./App.css";
 
+const API_BASE_URL = (
+  import.meta.env.VITE_API_URL || "http://localhost:5000"
+).replace(/\/$/, "");
+
 function App() {
   const [creators, setCreators] = useState([
     {
@@ -61,7 +65,7 @@ function App() {
 
     try {
       const response = await fetch(
-        "http://localhost:5000/api/ai/match",
+        `${API_BASE_URL}/api/ai/match`,
         {
           method: "POST",
           headers: {
@@ -501,4 +505,3 @@ function App() {
 }
 
 export default App;
-
