@@ -19,7 +19,7 @@ services:
       - key: FRONTEND_URL
         value: https://creatorhub-frontend.onrender.com
 
-  - type: static
+  - type: static_site
     name: creatorhub-frontend
     rootDir: frontend
     buildCommand: npm ci && npm run build
