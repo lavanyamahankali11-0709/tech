@@ -17,7 +17,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: FRONTEND_URL
-        value: https://creatorhub-frontend.onrender.com
+        value: https://creatorhub-frontend-58au.onrender.com
 
   - type: web
     name: creatorhub-frontend
@@ -27,7 +27,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        value: https://creatorhub-api.onrender.com
+        value: https://creatorhub-api-ux9z.onrender.com
     routes:
       - type: rewrite
         source: /*
