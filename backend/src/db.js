@@ -110,7 +110,7 @@ async function initializeDatabase() {
         verified_tools, verified_workflows, verified_past_work, portfolio
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE,
-        $8, $13, $14, $15::jsonb
+        $13, $14, $15, $16::jsonb
       ) ON CONFLICT (id) DO NOTHING`,
       [
         creator.id,
@@ -126,6 +126,7 @@ async function initializeDatabase() {
         creator.followers,
         creator.engagement,
         creator.verified ? tools : [],
+        creator.verified,
         creator.verified,
         JSON.stringify(portfolio),
       ]
