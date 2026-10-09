@@ -6,6 +6,9 @@ const cors = require("cors");
 const helmet = require("helmet");
 const compression = require("compression");
 const rateLimit = require("express-rate-limit");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { pool, query, initializeDatabase } = require("./db");
 
 const {
   creators = [],
@@ -17,6 +20,11 @@ const {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  throw new Error("JWT_SECRET must be configured with at least 32 characters");
+}
 
 // Allow the frontend development ports, including 5175.
 const allowedOrigins = new Set([
@@ -87,6 +95,60 @@ const ok = (res, data, message = "Success") =>
 const fail = (res, status, message) =>
   res.status(status).json({ success: false, message });
 
+const profileFields = `
+  id, owner_id AS "ownerId", display_name AS name, tagline, bio, location,
+  niche, skills, tools, content_types AS "contentTypes", formats, followers,
+  engagement, commercial_use AS "commercialUse", verified_tools AS "verifiedTools",
+  verified_workflows AS "verifiedWorkflows", verified_past_work AS "verifiedPastWork",
+  portfolio, created_at AS "createdAt"
+`;
+
+function createToken(user) {
+  return jwt.sign(
+    { sub: user.id, role: user.role, name: user.name, email: user.email },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+}
+
+function authenticate(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const token = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  if (!token) {
+    return fail(res, 401, "Sign in to continue");
+  }
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    return next();
+  } catch (error) {
+    if (error instanceof jwt.TokenExpiredError || error instanceof jwt.JsonWebTokenError) {
+      return fail(res, 401, "Your session has expired. Please sign in again.");
+    }
+    return next(error);
+  }
+}
+
+function requireRole(role) {
+  return (req, res, next) => {
+    if (req.user.role !== role) {
+      return fail(res, 403, `A ${role} account is required for this action`);
+    }
+    return next();
+  };
+}
+
+function stringArray(value, maxItems = 12, maxLength = 60) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((item) => typeof item === "string")
+    .map((item) => item.trim().slice(0, maxLength))
+    .filter(Boolean))].slice(0, maxItems);
+}
+
 // Creator matching score
 function score(creator, body = {}) {
   const niche = clean(body.niche, 50).toLowerCase();
@@ -154,9 +216,97 @@ app.get("/health", (req, res) => {
   return ok(res, {
     service: "CreatorHub AI Backend",
     status: "running",
-    storage: "in-memory",
+    storage: "postgresql",
     uptimeSeconds: Math.round(process.uptime()),
   });
+});
+
+// Authentication
+app.post("/api/auth/register", async (req, res, next) => {
+  try {
+    const name = clean(req.body?.name, 80);
+    const email = clean(req.body?.email, 254).toLowerCase();
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const role = req.body?.role;
+
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return fail(res, 400, "Enter your name and a valid email address");
+    }
+    if (password.length < 8 || password.length > 128) {
+      return fail(res, 400, "Password must be between 8 and 128 characters");
+    }
+    if (!["brand", "creator"].includes(role)) {
+      return fail(res, 400, "Choose a brand or creator account");
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const result = await query(
+      `INSERT INTO users (name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, role`,
+      [name, email, passwordHash, role]
+    );
+    const user = result.rows[0];
+
+    if (role === "creator") {
+      await query(
+        `INSERT INTO creator_profiles (id, owner_id, display_name, tagline, bio)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          `creator_${user.id}`,
+          user.id,
+          name,
+          "AI creator · Complete your profile",
+          "Add your tools, skills, workflows and portfolio to help brands discover your work.",
+        ]
+      );
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: "Account created",
+      data: { token: createToken(user), user },
+    });
+  } catch (error) {
+    if (error.code === "23505") {
+      return fail(res, 409, "An account with this email already exists");
+    }
+    return next(error);
+  }
+});
+
+app.post("/api/auth/login", async (req, res, next) => {
+  try {
+    const email = clean(req.body?.email, 254).toLowerCase();
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const result = await query(
+      "SELECT id, name, email, role, password_hash FROM users WHERE email = $1",
+      [email]
+    );
+    const user = result.rows[0];
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      return fail(res, 401, "Email or password is incorrect");
+    }
+
+    delete user.password_hash;
+    return ok(res, { token: createToken(user), user }, "Signed in");
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/auth/me", authenticate, async (req, res, next) => {
+  try {
+    const result = await query(
+      "SELECT id, name, email, role, created_at AS \"createdAt\" FROM users WHERE id = $1",
+      [req.user.sub]
+    );
+    if (!result.rows[0]) return fail(res, 404, "Account not found");
+    return ok(res, result.rows[0]);
+  } catch (error) {
+    return next(error);
+  }
 });
 
 // Dashboard
@@ -186,78 +336,134 @@ app.get("/api/dashboard", (req, res) => {
   });
 });
 
-// Search and paginate creators
-app.get("/api/creators", (req, res) => {
-  const search = clean(req.query.search, 80).toLowerCase();
-  const niche = clean(req.query.niche, 50).toLowerCase();
-  const city = clean(req.query.city, 50).toLowerCase();
-
-  const minFollowers = Math.max(0, num(req.query.minFollowers, 0));
-  const maxFollowers = Math.max(
-    0,
-    num(req.query.maxFollowers, Number.MAX_SAFE_INTEGER)
-  );
-
-  const page = Math.max(1, Math.floor(num(req.query.page, 1)));
-  const limit = Math.min(
-    50,
-    Math.max(1, Math.floor(num(req.query.limit, 10)))
-  );
-
-  if (minFollowers > maxFollowers) {
-    return fail(res, 400, "minFollowers cannot exceed maxFollowers");
-  }
-
-  const result = creators.filter((creator) => {
-    const searchableText = [
-      creator.name,
-      creator.niche,
-      creator.city,
-      creator.language,
-    ]
-      .map(lower)
-      .join(" ");
-
-    const followers = Math.max(0, num(creator.followers));
-
-    return (
-      (!search || searchableText.includes(search)) &&
-      (!niche || lower(creator.niche) === niche) &&
-      (!city || lower(creator.city) === city) &&
-      followers >= minFollowers &&
-      followers <= maxFollowers
+// Search creators by profile, AI tools, skills and content types
+app.get("/api/creators", async (req, res, next) => {
+  try {
+    const search = clean(req.query.search, 80).toLowerCase();
+    const niche = clean(req.query.niche, 50).toLowerCase();
+    const skill = clean(req.query.skill, 60);
+    const tool = clean(req.query.tool, 60);
+    const contentType = clean(req.query.contentType, 60);
+    const page = Math.max(1, Math.floor(num(req.query.page, 1)));
+    const limit = Math.min(50, Math.max(1, Math.floor(num(req.query.limit, 24))));
+    const result = await query(
+      `SELECT ${profileFields} FROM creator_profiles
+       WHERE ($1 = '' OR LOWER(display_name || ' ' || bio || ' ' || niche || ' ' || location) LIKE '%' || $1 || '%')
+         AND ($2 = '' OR LOWER(niche) = $2)
+         AND ($3 = '' OR skills @> ARRAY[$3]::text[])
+         AND ($4 = '' OR tools @> ARRAY[$4]::text[])
+         AND ($5 = '' OR content_types @> ARRAY[$5]::text[])
+       ORDER BY verified_past_work DESC, verified_workflows DESC, engagement DESC, created_at DESC
+       LIMIT $6 OFFSET $7`,
+      [search, niche, skill, tool, contentType, limit, (page - 1) * limit]
     );
-  });
-
-  const total = result.length;
-  const start = (page - 1) * limit;
-
-  return ok(res, {
-    items: result.slice(start, start + limit),
-    pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit),
-    },
-  });
+    const count = await query(
+      `SELECT COUNT(*)::int AS total FROM creator_profiles
+       WHERE ($1 = '' OR LOWER(display_name || ' ' || bio || ' ' || niche || ' ' || location) LIKE '%' || $1 || '%')
+         AND ($2 = '' OR LOWER(niche) = $2)
+         AND ($3 = '' OR skills @> ARRAY[$3]::text[])
+         AND ($4 = '' OR tools @> ARRAY[$4]::text[])
+         AND ($5 = '' OR content_types @> ARRAY[$5]::text[])`,
+      [search, niche, skill, tool, contentType]
+    );
+    return ok(res, {
+      items: result.rows,
+      pagination: {
+        page, limit, total: count.rows[0].total,
+        totalPages: Math.ceil(count.rows[0].total / limit),
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 // Get one creator
-app.get("/api/creators/:id", (req, res) => {
-  const creator = creators.find(
-    (item) => String(item.id) === req.params.id
-  );
-
-  if (!creator) {
-    return fail(res, 404, "Creator not found");
+app.get("/api/creators/:id", async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT ${profileFields} FROM creator_profiles WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return fail(res, 404, "Creator not found");
+    return ok(res, result.rows[0]);
+  } catch (error) {
+    return next(error);
   }
+});
 
-  return ok(res, creator);
+app.put(
+  "/api/creators/me",
+  authenticate,
+  requireRole("creator"),
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const name = clean(body.name, 100);
+      if (!name) return fail(res, 400, "Creator name is required");
+      const portfolio = Array.isArray(body.portfolio)
+        ? body.portfolio.slice(0, 20).map((item) => ({
+            title: clean(item.title, 120),
+            description: clean(item.description, 500),
+            contentType: clean(item.contentType, 60),
+            tools: stringArray(item.tools, 10),
+            workflow: clean(item.workflow, 500),
+            format: clean(item.format, 30),
+            commercialUse: Boolean(item.commercialUse),
+            thumbnail: clean(item.thumbnail, 1000),
+          }))
+        : [];
+      const result = await query(
+        `INSERT INTO creator_profiles (
+          id, owner_id, display_name, tagline, bio, location, niche, skills,
+          tools, content_types, formats, followers, engagement, commercial_use,
+          verified_tools, verified_workflows, verified_past_work, portfolio,
+          updated_at
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+          $15, $16, $17, $18::jsonb, NOW()
+        ) ON CONFLICT (owner_id) DO UPDATE SET
+          display_name = EXCLUDED.display_name, tagline = EXCLUDED.tagline,
+          bio = EXCLUDED.bio, location = EXCLUDED.location, niche = EXCLUDED.niche,
+          skills = EXCLUDED.skills, tools = EXCLUDED.tools,
+          content_types = EXCLUDED.content_types, formats = EXCLUDED.formats,
+          followers = EXCLUDED.followers, engagement = EXCLUDED.engagement,
+          commercial_use = EXCLUDED.commercial_use, portfolio = EXCLUDED.portfolio,
+          updated_at = NOW()
+        RETURNING ${profileFields}`,
+        [
+          `creator_${req.user.sub}`, req.user.sub, name, clean(body.tagline, 140),
+          clean(body.bio, 2000), clean(body.location, 100), clean(body.niche, 60),
+          stringArray(body.skills), stringArray(body.tools),
+          stringArray(body.contentTypes), stringArray(body.formats),
+          Math.max(0, Math.floor(num(body.followers))), Math.max(0, num(body.engagement)),
+          Boolean(body.commercialUse), [],
+          false, false,
+          JSON.stringify(portfolio),
+        ]
+      );
+      return ok(res, result.rows[0], "Creator profile saved");
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+app.get("/api/creators/me", authenticate, requireRole("creator"), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT ${profileFields} FROM creator_profiles WHERE owner_id = $1`,
+      [req.user.sub]
+    );
+    return ok(res, result.rows[0] || null);
+  } catch (error) {
+    return next(error);
+  }
 });
 
 // AI creator matching
-app.post("/api/ai/match", (req, res) => {
+app.post("/api/ai/match", async (req, res, next) => {
+  try {
   const body = req.body || {};
 
   const minFollowers = Math.max(0, num(body.minFollowers, 0));
@@ -270,8 +476,15 @@ app.post("/api/ai/match", (req, res) => {
     return fail(res, 400, "minFollowers cannot exceed maxFollowers");
   }
 
-  const matches = creators
-    .map((creator) => score(creator, body))
+  const profiles = await query(`SELECT ${profileFields} FROM creator_profiles`);
+  const matches = profiles.rows
+    .map((creator) => score({
+      ...creator,
+      niche: creator.niche,
+      city: creator.location,
+      verified: creator.verifiedPastWork,
+      trustScore: creator.verifiedPastWork ? 95 : 70,
+    }, body))
     .sort((a, b) => b.matchScore - a.matchScore)
     .slice(0, 10);
 
@@ -280,10 +493,243 @@ app.post("/api/ai/match", (req, res) => {
     {
       query: body,
       matches,
-      totalMatches: creators.length,
+      totalMatches: profiles.rows.length,
     },
     "AI creator matching completed"
   );
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// Public campaign briefs and brand brief creation
+app.get("/api/briefs", async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT id, brand_name AS "brandName", title, description, content_type AS "contentType",
+        style, formats, aspect_ratio AS "aspectRatio", budget, commercial_use AS "commercialUse",
+        usage_terms AS "usageTerms", deadline, status, created_at AS "createdAt"
+       FROM briefs
+       WHERE ($1 = '' OR status = $1)
+       ORDER BY created_at DESC LIMIT 100`,
+      [clean(req.query.status, 20)]
+    );
+    return ok(res, result.rows);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/briefs/mine", authenticate, requireRole("brand"), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT b.id, b.brand_name AS "brandName", b.title, b.description,
+        b.content_type AS "contentType", b.style, b.formats,
+        b.aspect_ratio AS "aspectRatio", b.budget,
+        b.commercial_use AS "commercialUse", b.usage_terms AS "usageTerms",
+        b.deadline, b.status, b.created_at AS "createdAt",
+        COUNT(a.id)::int AS "applicationCount"
+       FROM briefs b LEFT JOIN brief_applications a ON a.brief_id = b.id
+       WHERE b.brand_id = $1
+       GROUP BY b.id
+       ORDER BY b.created_at DESC`,
+      [req.user.sub]
+    );
+    return ok(res, result.rows);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/briefs/applications/mine", authenticate, requireRole("creator"), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT a.id, a.brief_id AS "briefId", a.cover_note AS "coverNote",
+        a.status, a.created_at AS "createdAt", b.title AS "briefTitle",
+        b.brand_name AS "brandName"
+       FROM brief_applications a
+       JOIN creator_profiles p ON p.id = a.creator_id
+       JOIN briefs b ON b.id = a.brief_id
+       WHERE p.owner_id = $1
+       ORDER BY a.created_at DESC`,
+      [req.user.sub]
+    );
+    return ok(res, result.rows);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/briefs/:id/applications", authenticate, requireRole("creator"), async (req, res, next) => {
+  try {
+    const coverNote = clean(req.body?.coverNote, 2000);
+    if (coverNote.length < 30) {
+      return fail(res, 400, "Tell the brand why you are a good fit (at least 30 characters)");
+    }
+    const result = await query(
+      `INSERT INTO brief_applications (brief_id, creator_id, cover_note)
+       SELECT b.id, p.id, $3 FROM briefs b
+       JOIN creator_profiles p ON p.owner_id = $2
+       WHERE b.id = $1 AND b.status = 'open'
+       RETURNING id, brief_id AS "briefId", cover_note AS "coverNote",
+         status, created_at AS "createdAt"`,
+      [req.params.id, req.user.sub, coverNote]
+    );
+    if (!result.rows[0]) return fail(res, 404, "Open brief or creator profile not found");
+    return res.status(201).json({ success: true, message: "Pitch sent to the brand", data: result.rows[0] });
+  } catch (error) {
+    if (error.code === "23505") return fail(res, 409, "You already applied to this brief");
+    return next(error);
+  }
+});
+
+app.get("/api/briefs/:id/applications", authenticate, requireRole("brand"), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT a.id, a.cover_note AS "coverNote", a.status,
+        a.created_at AS "createdAt", p.id AS "creatorId",
+        p.display_name AS "creatorName", p.niche, p.tools,
+        p.portfolio, p.verified_tools AS "verifiedTools",
+        p.verified_workflows AS "verifiedWorkflows",
+        p.verified_past_work AS "verifiedPastWork"
+       FROM brief_applications a
+       JOIN briefs b ON b.id = a.brief_id
+       JOIN creator_profiles p ON p.id = a.creator_id
+       WHERE b.id = $1 AND b.brand_id = $2
+       ORDER BY a.created_at DESC`,
+      [req.params.id, req.user.sub]
+    );
+    const ownedBrief = await query(
+      "SELECT 1 FROM briefs WHERE id = $1 AND brand_id = $2",
+      [req.params.id, req.user.sub]
+    );
+    if (!ownedBrief.rowCount) return fail(res, 404, "Brief not found");
+    return ok(res, result.rows);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.patch("/api/briefs/:briefId/applications/:applicationId", authenticate, requireRole("brand"), async (req, res, next) => {
+  try {
+    const status = req.body?.status;
+    if (!["shortlisted", "accepted", "declined", "completed"].includes(status)) {
+      return fail(res, 400, "Choose shortlist, accept, decline, or complete this engagement");
+    }
+    const result = await query(
+      `UPDATE brief_applications a SET status = $1, updated_at = NOW()
+       WHERE a.id = $2 AND a.brief_id = $3
+         AND EXISTS (SELECT 1 FROM briefs b WHERE b.id = a.brief_id AND b.brand_id = $4)
+         AND ($1 <> 'completed' OR a.status = 'delivered')
+       RETURNING a.id, a.status`,
+      [status, req.params.applicationId, req.params.briefId, req.user.sub]
+    );
+    if (!result.rows[0]) return fail(res, 409, "Application not found or it must be delivered before completion");
+    if (status === "accepted" || status === "completed") {
+      await query(
+        "UPDATE briefs SET status = $1 WHERE id = $2 AND brand_id = $3",
+        [status === "completed" ? "completed" : "in_progress", req.params.briefId, req.user.sub]
+      );
+    }
+    return ok(res, result.rows[0], `Application ${status}`);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.patch("/api/brief-applications/:id/deliver", authenticate, requireRole("creator"), async (req, res, next) => {
+  try {
+    const result = await query(
+      `UPDATE brief_applications a SET status = 'delivered', updated_at = NOW()
+       FROM creator_profiles p
+       WHERE a.id = $1 AND a.creator_id = p.id AND p.owner_id = $2
+         AND a.status = 'accepted'
+       RETURNING a.id, a.status`,
+      [req.params.id, req.user.sub]
+    );
+    if (!result.rows[0]) return fail(res, 409, "Only an accepted engagement can be marked delivered");
+    return ok(res, result.rows[0], "Delivery submitted to the brand");
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/briefs", authenticate, requireRole("brand"), async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const title = clean(body.title, 120);
+    const description = clean(body.description, 4000);
+    const contentType = clean(body.contentType, 60);
+    const style = clean(body.style, 100);
+    const aspectRatio = clean(body.aspectRatio, 20);
+    const formats = stringArray(body.formats, 8, 30);
+    const budget = num(body.budget, 0);
+    if (!title || !description || !contentType || !style || !aspectRatio) {
+      return fail(res, 400, "Title, description, content type, style and aspect ratio are required");
+    }
+    if (
+      body.budget !== undefined &&
+      body.budget !== "" &&
+      (!Number.isFinite(Number(body.budget)) || Number(body.budget) < 0)
+    ) {
+      return fail(res, 400, "Budget must be a valid non-negative amount");
+    }
+    if (body.deadline) {
+      const deadline = new Date(`${body.deadline}T00:00:00.000Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(body.deadline) || Number.isNaN(deadline.getTime()) || deadline.toISOString().slice(0, 10) !== body.deadline) {
+        return fail(res, 400, "Deadline must be a valid date in YYYY-MM-DD format");
+      }
+    }
+    const result = await query(
+      `INSERT INTO briefs (
+        brand_id, title, brand_name, description, content_type, style, formats,
+        aspect_ratio, budget, commercial_use, usage_terms, deadline
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING id, brand_name AS "brandName", title, description,
+        content_type AS "contentType", style, formats,
+        aspect_ratio AS "aspectRatio", budget,
+        commercial_use AS "commercialUse", usage_terms AS "usageTerms",
+        deadline, status, created_at AS "createdAt"`,
+      [
+        req.user.sub, title, req.user.name, description, contentType, style,
+        formats, aspectRatio, budget, Boolean(body.commercialUse),
+        clean(body.usageTerms, 1000), body.deadline || null,
+      ]
+    );
+    return res.status(201).json({
+      success: true, message: "Creative brief published", data: result.rows[0],
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/ai/brief-builder", (req, res) => {
+  const roughIdea = clean(req.body?.roughIdea, 1000);
+  if (roughIdea.length < 10) {
+    return fail(res, 400, "Describe your campaign idea in at least 10 characters");
+  }
+
+  const lowerIdea = roughIdea.toLowerCase();
+  const contentType = /animat|motion|film|video|reel/.test(lowerIdea)
+    ? "AI film"
+    : /image|photo|poster|graphic|illustrat/.test(lowerIdea)
+      ? "Generative images"
+      : "Social campaign";
+  const aspectRatio = /youtube|landscape|wide/.test(lowerIdea) ? "16:9" : "9:16";
+  const subject = roughIdea.replace(/[.!?]+$/, "");
+
+  return ok(res, {
+    title: subject.length > 72 ? `${subject.slice(0, 69)}...` : subject,
+    description: `${subject}. Create original, brand-safe work with a clear visual hook and a polished final delivery. Include concept development, generation workflow, and one revision round.`,
+    contentType,
+    style: "Distinctive, polished, and on-brand",
+    formats: ["MP4", "Social cutdown"],
+    aspectRatio,
+    commercialUse: true,
+    usageTerms: "Commercial use in owned digital channels for 12 months; creator retains portfolio rights.",
+    assistanceNote: "Draft generated from your idea. Review and edit all licensing and delivery terms before publishing.",
+  }, "Brief draft created");
 });
 
 // List campaigns
@@ -491,11 +937,25 @@ app.use((err, req, res, next) => {
   return fail(res, 500, "Internal server error");
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`CreatorHub AI backend running at http://localhost:${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log("Allowed frontend ports: 5173, 5174, 5175");
-  console.log("Storage: in-memory; MongoDB is not required");
-});
+// Initialize persistent storage before accepting requests.
+initializeDatabase()
+  .then(() => {
+    const server = app.listen(PORT, () => {
+      console.log(`CreatorHub AI backend running on port ${PORT}`);
+      console.log(`Health check: /health`);
+      console.log("Storage: PostgreSQL");
+    });
 
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.on(signal, () => {
+        server.close(() => {
+          pool.end().then(() => process.exit(0));
+        });
+      });
+    }
+  })
+  .catch(async (error) => {
+    console.error("Backend startup failed:", error.message);
+    await pool.end();
+    process.exit(1);
+  });

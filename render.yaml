@@ -10,6 +10,12 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: creatorhub-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
       - key: FRONTEND_URL
         value: https://creatorhub-frontend.onrender.com
 
@@ -25,3 +31,9 @@ services:
       - type: rewrite
         source: /*
         destination: /index.html
+
+databases:
+  - name: creatorhub-db
+    databaseName: creatorhub
+    user: creatorhub
+    plan: free

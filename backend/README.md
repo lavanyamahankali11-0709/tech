@@ -11,14 +11,24 @@ npm run dev
 For the Render deployment instructions, see the repository-root `README.md`.
 
 ## Main APIs
+POST /api/auth/register
+POST /api/auth/login
+GET /api/auth/me
 GET /health
 GET /api/dashboard
 GET /api/creators
 GET /api/creators/:id
+PUT /api/creators/me
 POST /api/ai/match
 GET /api/campaigns
 POST /api/campaigns
 GET /api/campaigns/:id
+GET /api/briefs
+POST /api/briefs
+POST /api/briefs/:id/applications
+PATCH /api/briefs/:briefId/applications/:applicationId
+PATCH /api/brief-applications/:id/deliver
+POST /api/ai/brief-builder
 POST /api/ai/content
 POST /api/ai/performance
 GET /api/messages
